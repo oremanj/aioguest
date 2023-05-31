@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # asyncio "guest mode": run asyncio in the same thread as another event loop.
 # This is closely modeled after Trio's guest mode, and you should read about
 # it to understand what we're doing:
@@ -33,15 +35,21 @@ import asyncio
 import attrs
 import greenlet
 import itertools
+import logging
 import selectors
 import signal
 import sys
 import threading
+import warnings
+import weakref
 from trio.lowlevel import start_thread_soon
 from sniffio import thread_local as sniffio_loop
 from functools import partial
 from outcome import Outcome, Value, Error, capture
 from typing import Optional, Callable, Any
+
+
+log = logging.getLogger("aioguest")
 
 
 def yield_to_host(request):
@@ -57,9 +65,12 @@ def yield_to_host(request):
     synchronously. The GreenletExit exception will propagate out of run(),
     stopping the event loop.
     """
-    gr = greenlet.getcurrent()
+    # NB: it's important not to save the result of greenlet.getcurrent() here
+    # because it would interfere with the logic below that notices if the
+    # greenlet gets abandoned
+    parent = greenlet.getcurrent().parent
     try:
-        return gr.parent.switch(request)
+        return parent.switch(request)
     except greenlet.GreenletExit:
         warnings.warn(
             RuntimeWarning(
@@ -67,7 +78,33 @@ def yield_to_host(request):
                 "weird stuff might happen"
             )
         )
-        gr.unpatch()
+        gr = greenlet.getcurrent()
+        gr.unpatch()  # now it's a normal non-guest asyncio loop
+
+        # Our actual parent isn't going to see our result, so make sure someone else does
+        def reporter(result):
+            try:
+                log.warning(
+                    "Host loop abandoned us so we couldn't deliver the guest result: "
+                    + repr(result.unwrap())
+                )
+            except BaseException:
+                log.exception(
+                    "Host loop abandoned us so we couldn't deliver the guest exception:"
+                )
+        gr.parent = greenlet.greenlet(reporter, parent=gr.parent)
+
+        # Attempt to cause the aio loop to exit soon
+        if gr.main_task is not None and not gr.main_task.done():
+            gr.main_task.cancel(
+                "aioguest cancelling main task due to abandonment by host loop"
+            )
+        else:
+            for task in asyncio.all_tasks():
+                task.cancel(
+                    "aioguest cancelling all tasks due to abandonment by host loop with "
+                    "no active main task"
+                )
         return getattr(gr, "thread_outcome", None)
 
 
@@ -78,7 +115,7 @@ class SelectorOverrides:
         # Avoid the worker thread if possible: if we weren't asked to wait,
         # or if any I/O was immediately ready, then just do a brief yield.
         immediate_result = super().select(0)
-        if immediate_result or timeout <= 0:
+        if immediate_result or (timeout is not None and timeout <= 0):
             yield_to_host(None)
             return immediate_result
         # Otherwise defer the actual waiting to a thread.
@@ -107,7 +144,7 @@ class PatchedOverlappedModule:
 
         return getattr(_overlapped, name)
 
-    def __setattr__(self, name, value):
+    def __setattr__(self, name, value):  # pragma: no cover
         raise AttributeError("unexpected attribute assignment")
 
 
@@ -161,14 +198,9 @@ class EventLoopOverrides:
                 self._aioguest_guest_tick_scheduled = True
                 self._write_to_self()
 
-    def _add_callback(self, handle):
-        was_first = not self._ready
-        try:
-            return super()._add_callback(handle)
-        finally:
-            if was_first and not self._aioguest_guest_tick_scheduled:
-                self._aioguest_guest_tick_scheduled = True
-                self._write_to_self()
+    # NB: _add_callback also appends to self._ready, but it's only called from
+    # the event loop itself (to schedule FD reader/writer or signal callbacks)
+    # so it doesn't need to be able to wake us up
 
     # Attempt to finalize asyncio async generators in asyncio, without
     # taking over async generators that belong to the host loop.
@@ -224,9 +256,9 @@ def patch_one(obj, overrides, undo_list, *, _cache={}):
     try:
         patched = _cache[ty]
     except KeyError:
-        for disambiguator in itertools.count():
+        for disambiguator in itertools.count():  # pragma: no branch  # (can't skip loop)
             name = f"{ty.__name__}{disambiguator or ''}+aioguest"
-            if not hasattr(globals(), name):
+            if not hasattr(globals(), name):  # pragma: no branch
                 break
         patched = _cache[ty] = type(
             name,
@@ -245,6 +277,74 @@ def unpatch(undo_list):
         obj, orig_type = undo_list[-1]
         obj.__class__ = orig_type
         undo_list.pop()
+
+
+class CheckForZombieGreenlets:
+    """Logic for trying to cause another thread to execute
+    greenlet.getcurrent() in order to finalize an aioguest greenlet
+    that got collected on a different thread. See GuestState.__del__.
+    """
+
+    class WhenBoolChecked:
+        def __bool__(self):
+            greenlet.getcurrent()
+            return False
+
+    when_bool_checked = WhenBoolChecked()
+
+    @attrs.define
+    class DuringGC:
+        """Create a GC cycle and call greenlet.getcurrent() when it is collected.
+        Repeat this process with one attempt per GC until `ref` is no longer alive
+        or we've tried too many times.
+        """
+        ref: weakref.ref
+        count: int = 0
+        cycle: DuringGC = attrs.Factory(lambda self: self, takes_self=True)
+
+        def __del__(self):
+            greenlet.getcurrent()
+            if self.ref() is not None:  # pragma: no cover
+                if self.count >= 5:
+                    warnings.warn(
+                        RuntimeWarning(
+                            "asyncio guest run got abandoned without properly finishing, "
+                            "and we couldn't get its thread to try to finish it. "
+                            "Weird stuff will probably happen."
+                        )
+                    )
+                else:
+                    # try again next GC cycle
+                    type(self)(ref=self.ref, count=self.count + 1)
+
+    @staticmethod
+    def soon(gr_ref):
+        # The ways to interrupt another thread in Python without its
+        # cooperation are pretty limited:
+        # - Raise a signal. Only works when targeting the main thread,
+        #   and requires that you set up a signal handler in advance,
+        #   which might interfere with something the application is doing.
+        # - Py_AddPendingCall(). Only works when targeting the main thread,
+        #   and has a limited C-level API. We'll use this for the main thread.
+        # - PyThreadState_SetAsyncExc(). Can target any thread, but only
+        #   by making it raise an exception, which we don't want to do here.
+        # - Put something in a finalizer reachable from a GC cycle and hope
+        #   that it gets collected on the right thread. We'll use this for
+        #   non-main threads, but it's definitely not guaranteed to work.
+        import ctypes
+
+        # PyObject_IsTrue has the right signature for AddPendingCall.
+        # The __bool__ being called must return zero to indicate that
+        # the pending call is not raising an exception. A reference is
+        # not conveyed along with the call so we must use a global object.
+        ctypes.pythonapi.Py_AddPendingCall(
+            ctypes.cast(ctypes.pythonapi.PyObject_IsTrue, ctypes.c_void_p),
+            ctypes.cast(id(CheckForZombieGreenlets.when_bool_checked), ctypes.c_void_p),
+        )
+
+        # If the pending call doesn't work, hopefully we can observe a GC
+        # on the correct thread; we don't really have any other options.
+        CheckForZombieGreenlets.DuringGC(gr_ref)
 
 
 @attrs.define(eq=False)
@@ -307,6 +407,23 @@ class GuestState:
                 )
             patch_one(selector, SelectorOverrides, undo_list)
 
+    def __del__(self):
+        gr = weakref.ref(self.run_greenlet)
+        del self.run_greenlet
+        if gr() is not None:
+            # Greenlet was resurrected because it belongs to a
+            # different thread than the thread where __del__ is
+            # running; it needs to be finalized on its own thread
+            # (because you can't run a greenlet on a thread other than
+            # the one it was created on, because it owns part of the C
+            # stack of that thread). This will happen as soon as that
+            # thread calls greenlet.getcurrent()... which is difficult
+            # to force to happen, and is not particularly likely to
+            # happen, because the host event loop abandoned us and
+            # nothing else in the application is necessarily going to
+            # use greenlets. We can try a few things though.
+            CheckForZombieGreenlets.soon(gr)
+
     def guest_tick(self):
         prev_loop_name = sniffio_loop.name
         sniffio_loop.name = "asyncio"
@@ -336,6 +453,8 @@ class GuestState:
         self.loop._aioguest_guest_tick_scheduled = False
 
         def deliver(outcome):
+            nonlocal self  # so we can 'del' it below
+
             def in_main_thread():
                 self.run_next_send = outcome
                 del self.run_greenlet.thread_outcome
@@ -343,7 +462,19 @@ class GuestState:
                 self.guest_tick()
 
             self.run_greenlet.thread_outcome = outcome
-            self.run_sync_soon_threadsafe(in_main_thread)
+            try:
+                self.run_sync_soon_threadsafe(in_main_thread)
+            except BaseException:
+                # If the host loop stopped running and abandoned us,
+                # that might manifest in run_sync_soon_threadsafe
+                # raising an exception. Print a warning more useful
+                # than "unhandled exception in thread".
+                log.exception(
+                    "Exception in aioguest calling run_sync_soon_threadsafe; "
+                    "likely the host loop has abandoned us"
+                )
+                # This helps break a cycle so the issue will be noticed sooner
+                del self
 
         start_thread_soon(request, deliver)
 
@@ -352,7 +483,17 @@ def manage_guest_run(runner, coro):
     # On Pythons 3.11 and later, with asyncio.Runner, we can get the loop
     # before calling run(), so we just need a thunk that does run + close.
     __tracebackhide__ = True
+
+    def determine_main_task():
+        for task in asyncio.all_tasks():
+            if task.get_coro() is coro:
+                greenlet.getcurrent().main_task = task
+                break
+        else:
+            greenlet.getcurrent().main_task = None
+
     with runner:
+        runner.get_loop().call_soon(determine_main_task)
         return runner.run(coro)
 
 
@@ -362,7 +503,17 @@ async def wrap_main(coro):
     # running. This wraps the main task to send the loop to start_guest_run
     # so it can add its monkeypatching before anything interesting happens.
     __tracebackhide__ = True
-    greenlet.getcurrent().parent.switch(asyncio.get_running_loop())
+    try:
+        greenlet.getcurrent().main_task = asyncio.current_task()
+        parent = greenlet.getcurrent().parent
+        # If there is a problem doing the monkeypatching, GreenletExit will be
+        # raised here:
+        parent.switch(asyncio.get_running_loop())
+    except BaseException:  # pragma: no cover
+        # This does run (a test fails if you comment out the close()) but
+        # doesn't show up in coverage records for some reason
+        coro.close()
+        raise
     return await coro
 
 
@@ -385,25 +536,41 @@ def start_guest_run(
         prev_wakeup_fd = None
 
     if hasattr(asyncio, "Runner"):
-        runner = asyncio.Runner(debug=debug, loop_factory=loop_factory)
-        loop = runner.get_loop()
-        loop._aioguest_prev_asyncgen_hooks = sys.get_asyncgen_hooks()
-        guest_state = GuestState(
-            loop=loop,
-            prev_wakeup_fd=prev_wakeup_fd,
-            run_sync_soon_threadsafe=run_sync_soon_threadsafe,
-            run_sync_soon_not_threadsafe=run_sync_soon_not_threadsafe,
-            done_callback=done_callback,
-            run_greenlet=greenlet.greenlet(capture),
-            run_next_send=partial(manage_guest_run, runner, coro),
-        )
+        try:
+            runner = asyncio.Runner(debug=debug, loop_factory=loop_factory)
+            loop = runner.get_loop()
+            loop._aioguest_prev_asyncgen_hooks = sys.get_asyncgen_hooks()
+            guest_state = GuestState(
+                loop=loop,
+                prev_wakeup_fd=prev_wakeup_fd,
+                run_sync_soon_threadsafe=run_sync_soon_threadsafe,
+                run_sync_soon_not_threadsafe=run_sync_soon_not_threadsafe,
+                done_callback=done_callback,
+                run_greenlet=greenlet.greenlet(capture),
+                run_next_send=partial(manage_guest_run, runner, coro),
+            )
+        except BaseException:
+            coro.close()
+            raise
+        guest_state.guest_tick()  # to determine main_task
     else:
-        if loop_factory is not None:
-            raise TypeError("loop_factory is only supported on Python 3.11+")
-
-        prev_asyncgen_hooks = sys.get_asyncgen_hooks()
-        glet = greenlet.greenlet(capture)
-        loop = glet.switch(partial(asyncio.run, wrap_main(coro), debug=debug))
+        wrapped_coro = wrap_main(coro)
+        try:
+            if loop_factory is not None:
+                raise TypeError("loop_factory is only supported on Python 3.11+")
+            prev_asyncgen_hooks = sys.get_asyncgen_hooks()
+            glet = greenlet.greenlet(capture)
+        except BaseException:
+            coro.close()
+            wrapped_coro.close()
+            raise
+        loop = glet.switch(partial(asyncio.run, wrapped_coro, debug=debug))
+        if isinstance(loop, Outcome):
+            # asyncio.run() finished before first switch, probably due to error
+            done_callback(loop)
+            coro.close()
+            wrapped_coro.close()
+            return None
         loop._aioguest_prev_asyncgen_hooks = prev_asyncgen_hooks
         guest_state = GuestState(
             loop=loop,
@@ -419,4 +586,6 @@ def start_guest_run(
             firstiter=loop._asyncgen_firstiter_hook,
             finalizer=loop._asyncgen_finalizer_hook,
         )
-    run_sync_soon_not_threadsafe(guest_state.guest_tick)
+        run_sync_soon_not_threadsafe(guest_state.guest_tick)
+
+    return guest_state.run_greenlet.main_task

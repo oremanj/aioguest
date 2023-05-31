@@ -20,7 +20,7 @@ setup(
         "trio >= 0.16.0",
         "sniffio >= 1.3.0",
         "outcome",
-    ]
+    ],
     include_package_data=True,
     keywords=["async", "trio", "asyncio"],
     python_requires=">=3.7",
