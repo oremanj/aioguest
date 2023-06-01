@@ -1,0 +1,9 @@
+pytest
+pytest-cov
+attrs
+greenlet
+trio
+sniffio
+outcome
+black
+flake8

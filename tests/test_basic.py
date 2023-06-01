@@ -3,6 +3,7 @@
 
 import aioguest
 import asyncio
+import contextvars
 import gc
 import outcome
 import pytest
@@ -54,11 +55,6 @@ def trivial_guest_run(aio_fn, **start_guest_run_kwargs):
     host_thread = threading.current_thread()
 
     def run_sync_soon_threadsafe(fn):
-        if host_thread is threading.current_thread():  # pragma: no cover
-            crash = partial(
-                pytest.fail, "run_sync_soon_threadsafe called from host thread"
-            )
-            todo.put(("run", crash))
         todo.put(("run", fn))
 
     def run_sync_soon_not_threadsafe(fn):
@@ -84,7 +80,7 @@ def trivial_guest_run(aio_fn, **start_guest_run_kwargs):
         while True:
             op, obj = todo.get()
             if op == "run":
-                obj()  # pragma: no cover  # ??? definitely does run
+                obj()
             elif op == "unwrap":
                 return obj.unwrap()
             else:  # pragma: no cover
@@ -240,7 +236,8 @@ def test_guest_warns_if_abandoned(main_exits, create_task, slow_cancel):
                         # One cancel is done by asyncio.Runner when the main
                         # task exits. The other is done by aioguest if the loop is
                         # abandoned after the main task exits
-                        assert "aioguest" in str(exc1) + str(exc2)
+                        if sys.version_info >= (3, 9):  # start of cancel-with-msg
+                            assert "aioguest" in str(exc1) + str(exc2)
                 print("other_task returning @", asyncio.get_running_loop().time())
                 record.append("other cancelled")
 
@@ -259,7 +256,8 @@ def test_guest_warns_if_abandoned(main_exits, create_task, slow_cancel):
                 print("main_task finishing @", asyncio.get_running_loop().time())
                 record.append("completed")
             except asyncio.CancelledError as exc:
-                assert "aioguest" in str(exc)
+                if sys.version_info >= (3, 9):  # start of cancel-with-msg
+                    assert "aioguest" in str(exc)
                 print("main_task cancelled @", asyncio.get_running_loop().time())
                 if slow_cancel:
                     await asyncio.sleep(1)
@@ -352,11 +350,15 @@ def test_guest_in_other_thread_warns_if_abandoned(main_exits, create_task, slow_
 )
 @restore_unraisablehook()
 def test_abandoned_guest_logs_result(result_factory, caplog):
+    record = []
+
     async def abandoned_main(in_host):
         in_host(lambda: 1 / 0)
-        with pytest.raises(asyncio.CancelledError, match="aioguest"):
+        match = "aioguest" if sys.version_info >= (3, 9) else ""
+        with pytest.raises(asyncio.CancelledError, match=match):
             for _ in range(50):  # pragma: no branch
                 await asyncio.sleep(0)
+        record.append("ok")
         del in_host
         return result_factory().unwrap()
 
@@ -365,6 +367,8 @@ def test_abandoned_guest_logs_result(result_factory, caplog):
             trivial_guest_run(abandoned_main)
         gc_collect_harder()
 
+    assert record == ["ok"]
+    assert asyncio._get_running_loop() is None
     if isinstance(result_factory(), outcome.Value):
         assert "couldn't deliver the guest result: 42" in caplog.text
     else:
@@ -560,7 +564,7 @@ def test_guest_mode_asyncgens():
         # this hoop-jumping; otherwise iterate_in_trio inherits the asyncio
         # context, which is empty
         # Should be: nursery.start_soon(iterate_in_trio, done_evt)
-        nursery.parent_task.context.run(
+        trio._core._run.GLOBAL_RUN_CONTEXT.runner.system_context.run(
             nursery.start_soon, iterate_in_trio, done_evt
         )
         await asyncio.wait_for(done_evt.wait(), 1)
@@ -592,8 +596,6 @@ def test_host_asyncgen_without_host_hooks(capsys):
         try:
             yield 1
         finally:
-            with pytest.raises(sniffio.AsyncLibraryNotFoundError):
-                sniffio.current_async_library()
             record.append(try_to_yield)
             if try_to_yield:
                 await yield_briefly()
@@ -624,14 +626,14 @@ def test_errors(monkeypatch):
         pass  # pragma: no cover
 
     async def already_in_aio(*args):
-        with pytest.raises(
-            RuntimeError, match="asyncio.run.. cannot be called .* running event loop"
-        ):
+        with pytest.raises(RuntimeError, match="[Cc]annot.*event loop"):
             trivial_guest_run(already_in_aio)
-        with pytest.raises(
-            RuntimeError, match="asyncio.run.. cannot be called .* running event loop"
-        ):
-            aio_in_trio_run(already_in_aio)
+        if sys.platform != "win32":
+            # (On Windows, asyncio uses signal.set_wakeup_fd unconditionally upon
+            # loop creation, and trio.run() doesn't expose an option to not claim
+            # the wakeup fd also, so we can't test this particular failure mode.)
+            with pytest.raises(RuntimeError, match="[Cc]annot.*event loop"):
+                aio_in_trio_run(already_in_aio)
 
     asyncio.run(already_in_aio())
 

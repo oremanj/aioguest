@@ -14,5 +14,4 @@ def start_guest_run(
     run_sync_soon_not_threadsafe: Callable[[Callable[[], None]], None] | None = None,
     debug: bool | None = None,
     loop_factory: Callable[[], asyncio.AbstractEventLoop] | None = None,
-) -> asyncio.Task[T] | None:
-    ...
+) -> asyncio.Task[T] | None: ...
