@@ -1,6 +1,22 @@
 aioguest: run asyncio and another event loop in the same thread
 ===============================================================
 
+.. image:: https://img.shields.io/pypi/v/aioguest.svg
+   :target: https://pypi.org/project/aioguest
+   :alt: Latest PyPI version
+
+.. image:: https://github.com/oremanj/aioguest/actions/workflows/ci.yml/badge.svg
+   :target: https://github.com/oremanj/aioguest/actions/workflows/ci.yml
+   :alt: Automated test status
+
+.. image:: https://codecov.io/gh/oremanj/aioguest/branch/master/graph/badge.svg
+   :target: https://codecov.io/gh/oremanj/aioguest
+   :alt: Test coverage
+
+.. image:: https://img.shields.io/badge/code%20style-black-000000.svg
+   :target: https://github.com/ambv/black
+   :alt: Code style: black
+
 `Trio <https://github.com/python-trio/trio>`__, an alternate async framework
 for Python, supports a feature called `"guest mode"
 <https://trio.readthedocs.io/en/stable/reference-lowlevel.html#using-guest-mode-to-run-trio-on-top-of-other-event-loops>`__ where it can run in the same thread as
