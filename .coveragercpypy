@@ -1,5 +1,9 @@
 [run]
 branch=True
+# cannot specify concurrency=greenlet on pypy (that's why this is a separate file)
+source=
+  aioguest
+  tests
 omit=
   setup.py
 # The test suite spawns subprocesses to test some stuff, so make sure
